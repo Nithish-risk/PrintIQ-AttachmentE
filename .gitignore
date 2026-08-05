@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+outputs/*
+!outputs/.gitkeep
+.streamlit/secrets.toml
+.venv/
+.DS_Store
+*.zip
