@@ -198,6 +198,91 @@ class RuleFieldMatcher:
                 best = max(best, float(fuzz.token_set_ratio(lu, target_u)))
         return best
 
+    def score_candidates(self, rule: PrintRule) -> List[tuple]:
+        """Score every DI field for *rule* without consuming anything.
+
+        Returns ``[(score, field), ...]`` sorted best-first. Separated from
+        ``match`` so the engine can assign globally: scoring all rules against
+        all fields first, then resolving conflicts by descending score, rather
+        than letting whichever rule is reached first take a field it only
+        weakly deserves.
+
+        That ordering bug is what let the page-title rule "WISCONSIN MARRIAGE
+        LICENSE APPLICATION" claim LICENSE FEE / 50.00 at 77.78 (both contain
+        "LICENSE"), forcing the real LICENSE FEE rule onto REISSUE LICENSE FEE
+        and leaving the REISSUE rule with nothing -- one bad grab corrupting
+        three rows.
+        """
+        labels = [clean_text(x) for x in (rule.item, rule.label_printed) if x]
+        labels = [l for l in labels if len(l) >= 3]
+        if not labels or not self.fields:
+            return []
+        rule_sec = norm(rule.section or "")
+        rule_sub = norm(rule.subsection or "")
+        rule_kind = _rule_expected_kind(rule)
+
+        scored = []
+        for it in self.fields:
+            key_score = self._text_score(labels, it["key"])
+            if it["kind"] == "composite":
+                value_score = min(self._text_score(labels, it["value"]), VALUE_MATCH_CAP)
+                key_score = max(key_score, value_score - 10.0)
+            if key_score < self.threshold:
+                continue
+            score = key_score
+            if not _kinds_compatible(rule_kind, it["kind"]):
+                score += KIND_MISMATCH_PENALTY
+            # Section agreement. The client confirms Section is always present
+            # in the sheet, but DI leaves it null on many fields, so we only
+            # apply the bonus/penalty when BOTH sides actually carry one.
+            if rule_sec and it["section"]:
+                agree = rule_sec in norm(it["section"]) or norm(it["section"]) in rule_sec
+                score += SECTION_MATCH_BONUS if agree else SECTION_MISMATCH_PENALTY
+            if rule_sub and it["subsection"]:
+                agree = rule_sub in norm(it["subsection"]) or norm(it["subsection"]) in rule_sub
+                score += SUBSECTION_MATCH_BONUS if agree else SUBSECTION_MISMATCH_PENALTY
+            if is_sentinel(it["value"]):
+                score -= 5.0
+            scored.append((score, it))
+
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return scored
+
+    def assign_all(self, rules: List[PrintRule]) -> Dict[str, dict]:
+        """Bind every rule to its best DI field via global best-first matching.
+
+        Builds the full (rule, field, score) space, then walks it in descending
+        score order, giving each field to the rule that wants it most. A rule
+        whose top choice was taken falls through to its next-best candidate
+        instead of being stranded, which is what consume-once-in-document-order
+        could not do.
+
+        Multi-part rules additionally absorb their sibling fields on the same
+        printed line (see ``modules.field_grouping``).
+        """
+        from modules.field_grouping import collect_group, merge_group
+
+        pairs = []
+        for rule in rules:
+            if rule.rule_type == "NO_PRINT_RULE":
+                continue
+            for score, field in self.score_candidates(rule):
+                if score >= MIN_ACCEPT_SCORE:
+                    pairs.append((score, rule, field))
+        pairs.sort(key=lambda t: (-t[0], t[1].id))
+
+        assigned: Dict[str, dict] = {}
+        for score, rule, field in pairs:
+            if rule.id in assigned or field["order"] in self._used:
+                continue
+            group = collect_group(field, rule.part_labels, self.fields, self._used)
+            merged = merge_group(group, rule.part_labels, rule.part_separators)
+            merged["_match_score"] = round(score, 2)
+            assigned[rule.id] = merged
+            for order in merged.get("_group_orders", [field["order"]]):
+                self._used.add(order)
+        return assigned
+
     def match(self, rule: PrintRule, consume: bool = True) -> Optional[dict]:
         labels = [clean_text(x) for x in (rule.item, rule.label_printed) if x]
         labels = [l for l in labels if len(l) >= 3]
@@ -253,42 +338,139 @@ class RuleFieldMatcher:
 
 
 _MAX_CHARS_RE = re.compile(r"(\d{1,3})")
+_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+# "4 or Shrink to fit" in the char-size cell means shrinking is permitted even
+# when no separate shrink-size column is populated.
+_SHRINK_WORDS_RE = re.compile(r"shrink\s*to\s*fit|shrink", re.IGNORECASE)
+# A month name or a numeric date -- evidence that an EXAMPLE really is a date.
+_DATE_EXAMPLE_RE = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)\b|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_date(text: str) -> bool:
+    """True when *text* contains real date evidence (month name or numerics)."""
+    return bool(_DATE_EXAMPLE_RE.search(text or ""))
+
+
+
+def _first_number(text: Optional[str]) -> Optional[float]:
+    """First number in a spec cell, e.g. "10 pt" -> 10.0. None when absent."""
+    m = _NUMBER_RE.search(clean_text(text or ""))
+    return float(m.group(1)) if m else None
+
+
+def _field_formatting(field: dict) -> dict:
+    """Best-effort formatting dict for a DI field.
+
+    DI puts formatting either directly on the structured_field or nested inside
+    its ``value`` dict, so probe both. Returns ``{}`` when nothing is reported --
+    callers must treat that as "unknown", never as a failure.
+    """
+    raw = field.get("raw") if isinstance(field.get("raw"), dict) else {}
+    fmt = raw.get("formatting")
+    if not isinstance(fmt, dict):
+        value = raw.get("value")
+        if isinstance(value, dict) and isinstance(value.get("formatting"), dict):
+            fmt = value["formatting"]
+    return fmt if isinstance(fmt, dict) else {}
+
+
+def _reported_font_size(field: dict) -> Optional[float]:
+    """Estimated printed font size in points, or None.
+
+    IMPORTANT: Azure DI does not report a font size. ``azure_doc_intelligence``
+    derives ``font_size_pt_estimate`` from the value's bounding-box HEIGHT
+    (height_fraction * page_height * 72). That is the height of the text's box,
+    including ascender/descender slack -- it is not the true point size and is
+    routinely off by 1-3 pt.
+
+    Callers must therefore treat this as ADVISORY only and never raise a hard
+    FAIL from it alone; see ``_check_char_size``.
+    """
+    fmt = _field_formatting(field)
+    val = fmt.get("font_size_pt_estimate")
+    return _first_number(str(val)) if val is not None else None
+
+
+def _reported_font_name(field: dict) -> str:
+    """Font family from the STYLE_FONT add-on, or "" when not reported.
+
+    Frequently ``None``: STYLE_FONT may be unavailable (see
+    ``features_degraded``), in which case font can't be validated at all.
+    """
+    fmt = _field_formatting(field)
+    for key in ("font_family", "font_style"):
+        val = fmt.get(key)
+        if val:
+            return clean_text(str(val))
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # Checkbox option parsing/alignment helpers (Phase B).
 # ---------------------------------------------------------------------------
 _STATE_RE = re.compile(r":?\s*(?:un)?selected\s*:?", re.IGNORECASE)
+# The post-processor serializes a checkbox group as
+#   "Yes-unselected;No-selected"      (label-state, semicolon separated)
+# while raw DI key_value_pairs use
+#   "Divorce: :unselected:"           (label: :state:)
+# Matching "<label><sep><state>" directly handles both, and -- critically --
+# anchors the state to the END of each chunk so a label containing the word
+# "selected" cannot be mistaken for the state marker.
+_OPTION_RE = re.compile(
+    r"^(?P<label>.*?)[\s:;\-\u2013\u2014]*:?\s*(?P<state>(?:un)?selected)\s*:?$",
+    re.IGNORECASE,
+)
 
 
 def _parse_di_checkbox_options(value: str) -> List[dict]:
     """Parse a DI checkbox-group value into ``[{label, state}, ...]``.
 
-    Handles the common serialized shapes, e.g.::
+    Handles both serializations in play:
 
-        "Divorce :unselected: Death :selected: Annulment :unselected:"
+        "Yes-unselected;No-selected"                    (structured_fields)
+        "Divorce :unselected: Death :selected:"         (raw key_value_pairs)
         "Divorce:unselected, Death:selected"
-        "No -selected- Yes -unselected-"
 
-    State defaults to ``unselected`` when a label has no explicit marker.
+    Splitting is done on the SEPARATORS BETWEEN options (``;`` or ``,``), or --
+    when neither is present -- immediately after each state word. The previous
+    implementation split on ``(?<=selected)[:\\-\\s]+``, which does not match the
+    hyphen-joined ``label-state`` form the post-processor actually produces: the
+    whole value collapsed into one bogus option, so every checkbox row aligned
+    against garbage labels.
+
+    State defaults to ``unselected`` when a label carries no explicit marker.
     """
     if not value:
         return []
-    text = str(value)
-    options: List[dict] = []
-    if "," in text and _STATE_RE.search(text):
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if ";" in text:
+        chunks = text.split(";")
+    elif "," in text and _STATE_RE.search(text):
         chunks = text.split(",")
     else:
-        # Keep each label attached to its trailing state marker.
-        chunks = re.split(r"(?<=selected)[:\-\s]+", text, flags=re.IGNORECASE)
+        # No explicit separator: break right after each state word.
+        chunks = re.split(r"(?<=selected)\s*:?\s+", text, flags=re.IGNORECASE)
+
+    options: List[dict] = []
     for chunk in chunks:
         c = clean_text(chunk)
         if not c:
             continue
-        m = re.search(r"(un)?selected", c, re.IGNORECASE)
-        state = "unselected"
+        m = _OPTION_RE.match(c)
         if m:
-            state = "unselected" if m.group(1) else "selected"
-        label = _STATE_RE.sub("", c).strip(" :,-\u2013\u2014")
+            label = clean_text(m.group("label")).strip(" :,-\u2013\u2014")
+            state = "unselected" if m.group("state").lower().startswith("un") else "selected"
+        else:
+            # No state marker at all -- treat the whole chunk as an unticked option.
+            label = _STATE_RE.sub("", c).strip(" :,-\u2013\u2014")
+            state = "unselected"
         if label:
             options.append({"label": label, "state": state})
     return options
@@ -347,8 +529,28 @@ def _detect_boilerplate_orders(fields: List[dict]) -> set[int]:
 class ComparisonEngine:
     """Produce a ComparisonSummary aligning rules ↔ DI structured_fields."""
 
-    def __init__(self, sheet: str, rules: List[PrintRule], structured_fields: List[dict]):
+    def __init__(self, sheet: str, rules: List[PrintRule], structured_fields: List[dict],
+                 key_value_pairs: Optional[List[dict]] = None):
+        """*key_value_pairs* are the RAW DI pairs (``analysis.key_value_pairs``).
+
+        They are optional so existing callers keep working, but without them the
+        geometry-driven checkbox regrouping cannot run and we fall back to the DI
+        group -- whose parent keys are demonstrably unreliable on this form.
+        """
         self.sheet = sheet
+        self.key_value_pairs = key_value_pairs or []
+        # Attachment E merges the Section / Sub-Section cells, so all but the
+        # first row of each block arrives blank. Forward-fill before matching:
+        # without it the section/subsection bonuses never fire and the ~20 item
+        # names duplicated between LICENSE - PARTY A and LICENSE - PARTY B score
+        # identically, letting consume-once bind one party's values to the other
+        # party's rules. Fail-safe: on any error we keep the rules as parsed.
+        try:
+            from modules.rule_normalizer import normalize_rules
+
+            rules = normalize_rules(list(rules or []))
+        except Exception:
+            pass
         self.rules = rules
         self.structured_fields = structured_fields or []
         self.matcher = RuleFieldMatcher(self.structured_fields)
@@ -357,9 +559,16 @@ class ComparisonEngine:
     @staticmethod
     def _check_presence(field: Optional[dict]) -> CheckResult:
         if field is None:
-            return CheckResult(name="presence", status=Status.FAIL,
-                               expected="field printed", actual="no matching field",
-                               message="No DI field matched this rule.")
+            # Per the client's universal rule: if a rule exists in the sheet,
+            # the field EXISTS in the PDF. So "no matching field" is never a
+            # property of the document -- it is our matcher failing to locate
+            # it. Reporting FAIL would blame the PDF for our own miss, so this
+            # is MISSING_DATA (no value found) with the cause made explicit.
+            return CheckResult(name="presence", status=Status.MISSING_DATA,
+                               expected="printed value",
+                               actual="(field not located)",
+                               message=("Could not confidently locate this field "
+                                        "in the PDF; no value was read."))
         value = field["value"]
         # Field located but blank -> MISSING_DATA. Field located but value is a
         # placeholder/sentinel (e.g. "Unknown", "N/A") -> UNKNOWN_DATA.
@@ -376,8 +585,23 @@ class ComparisonEngine:
 
     @staticmethod
     def _check_date(rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
+        """Hard check: printed value matches the rule's date pattern.
+
+        Guarded by the rule's own EXAMPLE. ``infer_date_pattern`` also reads the
+        instruction, and multi-part FORMAT clauses share a vocabulary with date
+        formats ("<First> + <Middle> + <Last> + comma <Title>" contains the same
+        "+ comma + space" wording as "<month> + space <dd> + comma"), so it fired
+        on ISSUING OFFICIAL and OFFICIANT MAILING ADDRESS and hard-FAILed a name
+        and an address for not being dates.
+
+        The example is the reliable discriminator: a genuine date row shows
+        "NOVEMBER 30, 1999", a name row shows "JOHN ALLEN JOHANSSEN".
+        """
         pattern = infer_date_pattern(rule.instruction, rule.example, rule.item)
         if not pattern:
+            return None
+        example = clean_text(rule.example or "")
+        if example and not _looks_like_date(example):
             return None
         actual = field["value"] if field else ""
         ok = validate_date(actual, pattern)
@@ -386,8 +610,101 @@ class ComparisonEngine:
                            expected=pattern, actual=actual or "(none)",
                            message="Date matches pattern." if ok else "Date missing or pattern mismatch.")
 
-    @staticmethod
-    def _check_checkbox_alignment(rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
+    def _check_checkbox_positional(self, rule: PrintRule, field: dict,
+                                   label_bbox) -> Optional[CheckResult]:
+        """Assess a checkbox rule that declares no expected options.
+
+        Answers only "which boxes are printed on this rule's label row, and is
+        any of them ticked?" -- no name alignment, because there is no option
+        list to align against. Two outcomes matter:
+
+          * The boxes found on the row do not match the ones the DI group
+            attributed to this field -> the group is mis-attributed. Reported as
+            NOT_VALIDATED with both lists shown, so the reviewer can see the
+            discrepancy. Deliberately NOT a FAIL: a DI extraction fault is not a
+            defect in the printed document.
+          * No boxes on the row at all -> we cannot say anything; return None and
+            leave the row as it was.
+
+        Without this, such rules received no checkbox check whatsoever and passed
+        on presence alone (CMP-0021 / CMP-0040).
+        """
+        if not self.key_value_pairs or len(label_bbox) != 4:
+            return None
+        try:
+            from modules.checkbox_geometry import boxes_on_label_row
+
+            found = boxes_on_label_row(
+                label_bbox=label_bbox,
+                page=field.get("page", 1),
+                checkbox_kvs=self.key_value_pairs,
+            )
+        except Exception:
+            return None
+        if not found:
+            di_options = _parse_di_checkbox_options(field.get("value") or "")
+            if di_options:
+                # The DI group claims checkboxes, yet none are printed on this
+                # field's own row. Observed on BIRTHPLACE - U.S. State/Territory
+                # (CMP-0021 label y 0.2543-0.2631, CMP-0040 y 0.4793-0.4883)
+                # whose attributed Parent/Mother/Father boxes sit at cy 0.3020
+                # and 0.5242 -- a different line entirely. Reporting this stops
+                # the row passing on "Field present." alone.
+                return CheckResult(
+                    name="checkbox_position",
+                    status=Status.NOT_VALIDATED,
+                    expected="checkboxes on this field's row",
+                    actual=", ".join(sorted(o["label"] for o in di_options)),
+                    message=(
+                        "No checkboxes are printed on this field's row, yet "
+                        "Document Intelligence attributed ["
+                        + ", ".join(sorted(o["label"] for o in di_options))
+                        + "] to it. The group belongs to a different field; "
+                        "this row could not be validated."
+                    ),
+                )
+            return None
+
+        di_options = _parse_di_checkbox_options(field.get("value") or "")
+        di_labels = {norm(o["label"]) for o in di_options}
+        row_labels = {norm(o["label"]) for o in found}
+
+        selected = [o["label"] for o in found if o["state"] == "selected"]
+        printed = ", ".join(f"{o['label']} ({o['state']})" for o in found)
+
+        if di_labels and row_labels and di_labels != row_labels:
+            return CheckResult(
+                name="checkbox_position",
+                status=Status.NOT_VALIDATED,
+                expected="checkboxes belonging to this field",
+                actual=printed,
+                message=(
+                    "Checkbox group looks mis-attributed: the boxes printed on "
+                    "this field's row are [" + printed + "] but Document "
+                    "Intelligence assigned this field ["
+                    + ", ".join(sorted(o["label"] for o in di_options))
+                    + "]. Verify visually; the extraction, not the PDF, is the "
+                    "likely fault."
+                ),
+            )
+
+        if selected:
+            return CheckResult(
+                name="checkbox_position",
+                status=Status.PASS,
+                expected="at least one option selected",
+                actual=printed,
+                message="Selected: " + ", ".join(selected) + ".",
+            )
+        return CheckResult(
+            name="checkbox_position",
+            status=Status.MISSING_DATA,
+            expected="at least one option selected",
+            actual=printed,
+            message="No checkboxes are selected on this field's row.",
+        )
+
+    def _check_checkbox_alignment(self, rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
         """Deterministically align Excel checkbox options with DI options.
 
         Runs only when the Excel rule's example parsed into a checkbox option
@@ -406,10 +723,52 @@ class ComparisonEngine:
         """
         if not field or field.get("kind") != "checkbox_group":
             return None
+        raw = field.get("raw") if isinstance(field.get("raw"), dict) else {}
+        label_bbox = raw.get("label_bbox") or raw.get("bbox") or []
         if rule.expected_kind != "checkbox_group" or not rule.expected_options:
-            return None
+            # No declared option list, so options cannot be aligned by name.
+            # Previously this returned None -- the row then carried NO checkbox
+            # check at all and rolled up to PASS on "Field present." alone, which
+            # is how BIRTHPLACE - U.S. State/Territory (CMP-0021 / CMP-0040)
+            # reported PASS while showing Parent/Mother/Father boxes belonging to
+            # a different field. Fall back to the purely positional check so the
+            # row is still assessed against what is actually printed on its line.
+            return self._check_checkbox_positional(rule, field, label_bbox)
 
-        di_options = _parse_di_checkbox_options(field["value"])
+        # Prefer options rebuilt from raw DI geometry over the DI group's own
+        # membership. The group KEY on this form is routinely mis-attributed
+        # (PROOF OF STERILITY carrying Groom/Bride/Spouse, LICENSE FEE carrying
+        # the ten issuance-method boxes), so its member list cannot be trusted
+        # either. The individual boxes are read correctly, so we re-derive the
+        # group from the rule's own option names plus proximity to the rule's
+        # matched label box. Falls back to the DI group whenever geometry finds
+        # nothing -- never worse than before.
+        regrouped = None
+        if self.key_value_pairs and len(label_bbox) == 4:
+            try:
+                from modules.checkbox_geometry import regroup
+
+                regrouped = regroup(
+                    rule_options=rule.expected_options,
+                    label_bbox=label_bbox,
+                    page=field.get("page", 1),
+                    checkbox_kvs=self.key_value_pairs,
+                )
+            except Exception:
+                regrouped = None
+
+        if regrouped:
+            di_options = [
+                {"label": o["label"], "state": o["state"]}
+                for o in regrouped["options"]
+            ]
+            source_note = (
+                f"(re-grouped by geometry: {regrouped['matched']}/"
+                f"{regrouped['expected']} options located)"
+            )
+        else:
+            di_options = _parse_di_checkbox_options(field["value"])
+            source_note = ""
         if not di_options:
             return None
 
@@ -470,25 +829,177 @@ class ComparisonEngine:
         parts = [selected_msg]
         if missing:
             parts.append("Options with no DI match: " + ", ".join(missing) + ".")
+        if source_note:
+            parts.append(source_note)
         if used_llm:
             parts.append("(LLM-aligned)")
 
-        # Status precedence:
-        #   * an expected option not found in the PDF at all -> FAIL (discrepancy)
-        #   * all options aligned but NONE are marked        -> MISSING_DATA
-        #   * at least one option is marked                  -> PASS
-        if missing:
-            status = Status.FAIL
-        elif not selected_labels:
-            status = Status.MISSING_DATA
-        else:
+        # Status precedence (per spec):
+        #   * NO option marked                    -> MISSING_DATA (no data given)
+        #   * at least one option marked          -> PASS
+        #
+        # An expected option we could not locate among the DI members is NOT a
+        # PDF defect: the client's position is that DI mis-GROUPS checkboxes
+        # (right boxes, wrong parent), so the option is on the page under
+        # another group. Reporting that as FAIL blames the document for an
+        # extraction fault, so unmatched options are surfaced in the message
+        # only and never change the verdict on their own.
+        if selected_labels:
             status = Status.PASS
+        else:
+            status = Status.MISSING_DATA
         return CheckResult(
             name="checkbox_alignment",
             status=status,
             expected=", ".join(rule.expected_options),
             actual="; ".join(aligned) if aligned else "(no options aligned)",
             message=" ".join(parts),
+        )
+
+    # Option labels that demand an accompanying free-text entry when selected.
+    _SPECIFY_HINTS = ("specify", "other, specify", "please specify", "if other")
+
+    @classmethod
+    def _check_specify_text(cls, rule: PrintRule, field: Optional[dict],
+                            selected_labels: List[str],
+                            all_fields: List[dict]) -> Optional[CheckResult]:
+        """Hard check: a selected "Other ... Specify" box must carry its text.
+
+        Per spec the free text is APPENDED INTO the checkbox group's own value
+        rather than living in a separate labelled field (confirmed by the sample
+        form: "Yes, other Spanish/Hispanic/Latino(a) (Specify) NIVI"). So we look
+        first inside this field's value for text that is neither an option label
+        nor a selection state, then fall back to a same-page text field whose key
+        mentions "specify".
+
+        A tick with no text is a genuine defect -> FAIL.
+        """
+        if not field or not selected_labels:
+            return None
+        specify_opts = [
+            o for o in selected_labels
+            if any(h in norm(o) for h in cls._SPECIFY_HINTS)
+        ]
+        if not specify_opts:
+            return None
+
+        # 1) Look inside the group's own serialized value for trailing free text.
+        raw_value = str(field.get("value") or "")
+        option_labels = {norm(d["label"]) for d in _parse_di_checkbox_options(raw_value)}
+        leftovers = []
+        for chunk in re.split(r"[;,]", _STATE_RE.sub(" ", raw_value)):
+            token = clean_text(chunk)
+            if not token:
+                continue
+            if norm(token) in option_labels:
+                continue
+            if norm(token) in ("selected", "unselected", "specify"):
+                continue
+            leftovers.append(token)
+        if leftovers:
+            return CheckResult(
+                name="specify_text",
+                status=Status.PASS,
+                expected=f"free text for {', '.join(specify_opts)}",
+                actual="; ".join(leftovers),
+                message="'Specify' option is selected and its text is printed.",
+            )
+
+        # 2) Fall back to a same-page text field explicitly keyed "specify".
+        page = field.get("page")
+        for other in all_fields:
+            if other.get("page") != page or other.get("kind") == "checkbox_group":
+                continue
+            if "specify" not in norm(other.get("key") or ""):
+                continue
+            if clean_text(other.get("value") or ""):
+                return CheckResult(
+                    name="specify_text",
+                    status=Status.PASS,
+                    expected=f"free text for {', '.join(specify_opts)}",
+                    actual=other.get("value") or "",
+                    message="'Specify' option is selected and its text is printed.",
+                )
+
+        return CheckResult(
+            name="specify_text",
+            status=Status.FAIL,
+            expected=f"free text for {', '.join(specify_opts)}",
+            actual="(blank)",
+            message=(
+                "A 'Specify' option is selected but no accompanying text was "
+                "printed."
+            ),
+        )
+
+    @staticmethod
+    def _check_char_size(rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
+        """Advisory check: printed character size vs. ``char_size``.
+
+        Per spec, shrink-to-fit is permitted only when the rule says so -- either
+        a populated shrink column, or wording like "4 or Shrink to fit" in the
+        char-size cell itself. Otherwise the size must match exactly.
+
+        Reported as NOT_VALIDATED rather than FAIL on mismatch, because the only
+        size DI gives us is a bounding-box-height ESTIMATE (see
+        ``_reported_font_size``), which is not accurate enough to condemn a
+        document. The tester sees the numbers and the discrepancy, and decides.
+        """
+        if not field:
+            return None
+        want = _first_number(rule.char_size)
+        if want is None:
+            return None
+        actual = _reported_font_size(field)
+        if actual is None:
+            return None
+
+        shrink_allowed = bool(_SHRINK_WORDS_RE.search(clean_text(rule.char_size or "")))
+        floor = _first_number(rule.shrink_size)
+        if floor is not None or shrink_allowed:
+            low = floor if floor is not None else 0.0
+            ok = low - 1.5 <= actual <= want + 1.5
+            expected = (
+                f"{low}-{want} pt (shrink-to-fit allowed)" if floor is not None
+                else f"<= {want} pt (shrink-to-fit allowed)"
+            )
+        else:
+            ok = abs(actual - want) <= 1.5
+            expected = f"{want} pt (exact; shrink not permitted)"
+
+        return CheckResult(
+            name="char_size",
+            status=Status.PASS if ok else Status.NOT_VALIDATED,
+            expected=expected,
+            actual=f"~{actual} pt (estimated from text height)",
+            message=(
+                "Character size is consistent with the rule."
+                if ok
+                else (
+                    "Estimated character size looks outside the allowed range. "
+                    "DI does not report true font size -- this figure is derived "
+                    "from the text's height, so please confirm visually."
+                )
+            ),
+        )
+
+    @staticmethod
+    def _check_font(rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
+        """Hard check: printed font family vs. the rule's ``font`` cell."""
+        want = clean_text(rule.font or "")
+        if not want or not field:
+            return None
+        actual = _reported_font_name(field)
+        if not actual:
+            return None
+        # Compare loosely: DI returns names like "Arial-BoldMT" for "Arial".
+        ok = norm(want) in norm(actual) or norm(actual) in norm(want)
+        return CheckResult(
+            name="font",
+            status=Status.PASS if ok else Status.FAIL,
+            expected=want,
+            actual=actual,
+            message="Font matches." if ok else "Printed font differs from the rule.",
         )
 
     @staticmethod
@@ -548,13 +1059,22 @@ class ComparisonEngine:
         if field.get("kind") == "checkbox_group":
             return None  # checkboxes are validated by alignment, not text rules
         instruction = clean_text(rule.instruction or "")
-        if not instruction and not clean_text(rule.if_unknown or ""):
+        if_unknown = clean_text(rule.if_unknown or "")
+        if not instruction and not if_unknown:
             return None
 
         value = field.get("value") or ""
+        unknown = is_sentinel(value)
+        # The 'if unknown' column is a SECOND stage that only ever applies to a
+        # placeholder value on a text row. A BLANK cell in that column is
+        # meaningful and explicitly documented by the clients as: "do nothing
+        # special, just print what is in the field" -- i.e. fall back to the
+        # print instruction alone. So we pass it through only when the value is
+        # actually a placeholder AND the cell is non-blank; otherwise the
+        # instruction verdict stands by itself.
+        effective_if_unknown = if_unknown if (unknown and if_unknown) else ""
         res = precomputed
         if res is None:
-            unknown = is_sentinel(value)
             try:
                 from modules.checkbox_llm import validate_instruction
 
@@ -568,7 +1088,7 @@ class ComparisonEngine:
                     bold=rule.bold or "",
                     font=rule.font or "",
                     is_unknown_value=unknown,
-                    if_unknown=rule.if_unknown or "",
+                    if_unknown=effective_if_unknown,
                 )
             except Exception:
                 res = None
@@ -646,6 +1166,13 @@ class ComparisonEngine:
 
         def _one(job):
             rule, value, unknown = job
+            # Mirror ``_check_instruction_llm`` exactly: the 'if unknown' rule is
+            # forwarded ONLY for a placeholder value on a text row with a
+            # non-blank cell. A blank cell means "just follow the instruction".
+            # If this diverged from the per-row path, a rule's verdict would
+            # depend on whether the pre-pass cache hit -- a reproducibility bug.
+            if_unknown = clean_text(rule.if_unknown or "")
+            effective_if_unknown = if_unknown if (unknown and if_unknown) else ""
             try:
                 return rule.id, validate_instruction(
                     item=rule.item or "",
@@ -657,7 +1184,7 @@ class ComparisonEngine:
                     bold=rule.bold or "",
                     font=rule.font or "",
                     is_unknown_value=unknown,
-                    if_unknown=rule.if_unknown or "",
+                    if_unknown=effective_if_unknown,
                 )
             except Exception:
                 return rule.id, None
@@ -671,10 +1198,40 @@ class ComparisonEngine:
 
     # ---- roll-up ----------------------------------------------------------
     @staticmethod
+    def _check_part_gaps(rule: PrintRule, field: Optional[dict]) -> Optional[CheckResult]:
+        """Report a blank sub-field sitting between two populated ones.
+
+        For "First + Middle + Last + Suffix", a blank Suffix is normal -- the
+        value simply ends. A blank MIDDLE with a populated Last is a gap: the
+        print job skipped a value it should have supplied.
+        """
+        if not field:
+            return None
+        from modules.field_grouping import find_part_gaps
+
+        gaps = find_part_gaps(field)
+        if not gaps:
+            return None
+        return CheckResult(
+            name="part_gaps",
+            status=Status.FAIL,
+            expected="every sub-field before the last populated one to be filled",
+            actual="blank: " + ", ".join(gaps),
+            message=(
+                "Gap in a multi-part field: " + ", ".join(gaps) +
+                " is blank but a later part is printed."
+            ),
+        )
+
+    @staticmethod
     def _rollup(checks: List[CheckResult], matched: bool) -> Status:
-        # No matching DI field at all -> FAIL.
-        if not matched:
-            return Status.FAIL
+        # NOTE: deliberately no "if not matched -> FAIL" short-circuit. Per the
+        # client's rule that every sheet row corresponds to a field that EXISTS
+        # in the PDF, a failure to locate one is OUR matching gap, not a defect
+        # in the document -- ``_check_presence`` already reports that honestly as
+        # MISSING_DATA. Overriding it here re-blamed the PDF and put 17 rows in
+        # FAIL whose only finding was "could not locate".
+        #
         # Precedence: any real discrepancy (FAIL) wins; then blank/no-value
         # (MISSING_DATA); then placeholder value (UNKNOWN_DATA); else PASS.
         order = [Status.FAIL, Status.MISSING_DATA, Status.UNKNOWN_DATA, Status.PASS]
@@ -694,11 +1251,16 @@ class ComparisonEngine:
         # results. ``instr_by_rule`` maps rule.id -> validate_instruction() dict.
         instr_by_rule: Dict[str, dict] = {}
         field_by_rule: Dict[str, Optional[dict]] = {}
+        # Global best-first assignment: score every rule against every field,
+        # then resolve conflicts by descending score. Replaces the previous
+        # document-order loop, where an early rule could consume a field a later
+        # rule deserved far more.
+        assigned = self.matcher.assign_all(self.rules)
         for rule in self.rules:
             if rule.rule_type == "NO_PRINT_RULE":
                 field_by_rule[rule.id] = None
                 continue
-            field_by_rule[rule.id] = self.matcher.match(rule, consume=True)
+            field_by_rule[rule.id] = assigned.get(rule.id)
         instr_by_rule = self._precompute_instructions(field_by_rule)
 
         # Boilerplate = page titles/headers (top-of-page or repeated across
@@ -713,7 +1275,12 @@ class ComparisonEngine:
             if t and len(norm(t)) >= 4
         }
         for f in self.matcher.fields:
-            text = norm(f["value"] or f["key"] or "")
+            # Only a field's *static text* can be an Excel label echoed onto the
+            # page, and static text means the field has no value of its own.
+            # Deliberately do NOT fall back to ``key`` here: a located-but-blank
+            # field whose KEY matches an Excel item is the "empty box that should
+            # have been filled" case, and suppressing it hides a real finding.
+            text = norm(f["value"] or "")
             if text and text in rule_texts:
                 boilerplate_orders.add(f["order"])
 
@@ -749,17 +1316,30 @@ class ComparisonEngine:
 
             presence = self._check_presence(field)
             checks: List[CheckResult] = [presence]
-            # When the field is present but blank (MISSING_DATA) or a placeholder
-            # (UNKNOWN_DATA), those states are terminal for the row: skip the
-            # other checks so the row always reports MISSING/UNKNOWN rather than
-            # being overridden by a format/instruction verdict on a non-value.
-            if presence.status in (Status.MISSING_DATA, Status.UNKNOWN_DATA):
+            # A blank field (MISSING_DATA) has no printed value, so there is
+            # nothing to validate a print rule against: presence is the finding.
+            #
+            # A placeholder (UNKNOWN / UNNAMED / 99999) is DIFFERENT -- it IS a
+            # printed value and must still be validated against the print rule,
+            # which is the primary contract. The ``if_unknown`` column is then a
+            # SECOND stage layered on top, and applies to text rows only (never
+            # checkbox rows). When the ``if_unknown`` cell is blank there is
+            # nothing special to do and the instruction verdict stands alone.
+            #
+            # Previously UNKNOWN_DATA short-circuited alongside MISSING_DATA, so
+            # every placeholder row skipped instruction validation entirely --
+            # 18 rows in the last run reported UNKNOWN_DATA without their print
+            # rule ever being checked.
+            if presence.status is Status.MISSING_DATA:
                 pass
             else:
                 for maybe in (
                     self._check_checkbox_alignment(rule, field),
+                    self._check_part_gaps(rule, field),
                     self._check_date(rule, field),
                     self._check_max_chars(rule, field),
+                    self._check_char_size(rule, field),
+                    self._check_font(rule, field),
                     self._check_bold(rule, field),
                     self._check_instruction_llm(rule, field, instr_by_rule.get(rule.id)),
                 ):
@@ -803,6 +1383,64 @@ class ComparisonEngine:
             for f in self.matcher.unused_fields()
             if f["order"] not in boilerplate_orders
         ]
+
+        # ---- Full-coverage pass: every printed value reaches the output ------
+        # The loop above emits one row per RULE, so a DI field that no rule
+        # claimed would only survive as a bare dict in ``unmatched_fields`` --
+        # invisible in the comparison table/overlay. That is exactly the
+        # "missed value" failure mode. Here we emit a real FieldComparison for
+        # each leftover (non-boilerplate) field so the reviewer sees 100% of the
+        # extracted values, geometry included.
+        #
+        # These rows are EXTRA PRINT OUTPUT: the PDF prints something the Excel
+        # spec has no rule for. There is no rule to validate against, so the
+        # status is NOT_VALIDATED (auditable, but never counted as a pass/fail
+        # against a rule that doesn't exist). Blank/placeholder values are still
+        # distinguished so a stray empty box is visible as such.
+        next_index = len(comparisons) + 1
+        for f in self.matcher.unused_fields():
+            if f["order"] in boilerplate_orders:
+                continue
+            value = f["value"] or ""
+            if not clean_text(value):
+                note = "Extra printed field located but no value is printed."
+            elif is_sentinel(value):
+                note = "Extra printed field with a placeholder (unknown) value."
+            else:
+                note = "Value printed in the PDF with no matching Excel print rule."
+            comparisons.append(
+                FieldComparison(
+                    id=f"CMP-{next_index:04d}",
+                    status=Status.NOT_VALIDATED,
+                    sheet=self.sheet,
+                    rule_id="",
+                    rule_type="UNMATCHED_FIELD",
+                    section=None,
+                    subsection=None,
+                    item=f["key"] or value,
+                    matched=False,
+                    match_score=0.0,
+                    di_kind=f["kind"],
+                    di_section=f["section"],
+                    di_subsection=f["subsection"],
+                    di_key=f["key"],
+                    di_value=value,
+                    page=f["page"],
+                    bbox=_field_bbox(f["raw"]),
+                    confidence=f["confidence"],
+                    checks=[
+                        CheckResult(
+                            name="unmatched_field",
+                            status=Status.NOT_VALIDATED,
+                            expected="a matching Excel print rule",
+                            actual=value or "(blank)",
+                            message=note,
+                        )
+                    ],
+                    message=note,
+                )
+            )
+            next_index += 1
 
         status_counts: Dict[str, int] = {}
         for c in comparisons:

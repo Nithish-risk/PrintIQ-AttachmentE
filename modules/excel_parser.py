@@ -2,8 +2,9 @@ import pandas as pd
 from pathlib import Path
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from rapidfuzz import fuzz
 from models.rule_models import PrintRule
-from utils.text_utils import clean_text
+from utils.text_utils import clean_text, norm
 from modules.excel_image_extractor import extract_cell_images
 
 HEADER_ALIASES = {
@@ -38,15 +39,45 @@ def _find_header_row(df_raw: pd.DataFrame) -> int:
 def _map_columns(columns) -> dict:
     """Map canonical rule fields to worksheet columns.
 
+    Delegates to ``modules.schema_resolver``, which scores every (role, header)
+    pair and assigns globally best-first. The previous implementation walked the
+    canonical fields in ``HEADER_ALIASES`` order and let the first alias that hit
+    an unused column win -- so an earlier role could steal a column belonging to
+    a later one, shifting every subsequent value by one. That is what put
+    ``6`` (the shrink size) into ``max_chars`` and ``10`` (the char size) into
+    ``shrink_size``, which would have hard-FAILed name rows against a 6-character
+    limit.
+
+    Global assignment removes the ordering dependency entirely: "Char. Size" is
+    claimed by the role that scores highest for it across all roles, not by
+    whichever role happens to be examined first.
+
+    Falls back to the legacy alias walk if the resolver cannot satisfy the
+    required roles, so an unusual sheet still parses.
+    """
+    try:
+        from modules.schema_resolver import resolve_schema
+
+        schema = resolve_schema([str(c) for c in columns])
+        if schema.usable:
+            mapping = dict(schema.mapping)
+            # ``shrink_char_size`` is this module's ``shrink_size``.
+            if "shrink_char_size" in mapping:
+                mapping["shrink_size"] = mapping.pop("shrink_char_size")
+            # ``item_number`` is metadata, not a matchable label.
+            mapping.pop("item_number", None)
+            return mapping
+    except Exception:
+        pass
+    return _map_columns_legacy(columns)
+
+
+def _map_columns_legacy(columns) -> dict:
+    """Original alias-priority mapping, kept as a fallback.
+
     Matching is **alias-priority**: for each canonical field the aliases are
     tried in the order listed, and the first alias that matches any not-yet-used
-    column wins (exact match preferred over substring, per alias). This lets a
-    more specific alias take precedence even when a shorter/looser column appears
-    earlier in the sheet.
-
-    Example: a sheet may contain both ``If = unknown, PRINT`` (a legacy, often
-    empty column) and ``If = Unknown; Note: ...`` (the populated one). Listing
-    the ``if = unknown; note`` alias first ensures the populated column wins.
+    column wins (exact match preferred over substring, per alias).
     """
     cleaned = [(col, clean_text(col).lower()) for col in columns]
     used: set = set()
@@ -193,6 +224,144 @@ def _options_from_instruction(instruction: str | None) -> list[str]:
     return seen
 
 
+# Trailing part list in an item name, e.g.
+#   "CURRENT NAME - First, Middle, Last, Suffix"
+#   "ISSUING OFFICIAL - First, Middle, Last, Title"
+#   "OFFICIANT MAILING ADDRESS - Street Address or PO Box, City, State, and Zip Code"
+# Captures everything after the final dash-like separator.
+_PART_TAIL_RE = re.compile(r"[-\u2013\u2014]\s*([^-\u2013\u2014]+)$")
+# "<First> + <Middle> + <Last>" inside a FORMAT clause -- the authoritative
+# ordering of the parts as they must be printed.
+_FORMAT_TOKEN_RE = re.compile(r"<\s*([^>]+?)\s*>")
+# "FORMAT:" / "Format:" introduces the printed layout. Present in ~60-70% of
+# multi-word rules; when present, tokens BEFORE it are the data source and
+# tokens after it are the printed parts.
+_FORMAT_ANCHOR_RE = re.compile(r"\bformat\s*:", re.IGNORECASE)
+
+
+def _split_parts(text: str) -> list[str]:
+    parts = [clean_text(p) for p in re.split(r",|\band\b", text or "")]
+    return [p for p in parts if p and len(p) <= 30]
+
+
+def _item_head(item: str | None) -> str:
+    """The item name with any trailing part list removed.
+
+    "CURRENT NAME - First, Middle, Last, Suffix" -> "CURRENT NAME"
+    "OFFICIANT MAILING ADDRESS - Street ..."     -> "OFFICIANT MAILING ADDRESS"
+    """
+    text = clean_text(item or "")
+    m = _PART_TAIL_RE.search(text)
+    head = text[: m.start()] if m else text
+    # Drop a leading item number ("56. Certifier's Address").
+    return clean_text(re.sub(r"^\s*\d+[\.\)]\s*", "", head))
+
+
+def _is_source_token(token: str, item_head: str) -> bool:
+    """True when a ``<...>`` token names the DATA SOURCE, not a printed part.
+
+    Instructions commonly open by naming the value being printed and only then
+    describe its layout::
+
+        PRINT <Party A Current Name>
+        FORMAT: <First> + <Middle> + <Last> + <Suffix>
+
+    ``FORMAT:`` is NOT a reliable keyword across clients, so we cannot anchor on
+    it. Instead we use a property that holds regardless of wording: the source
+    token restates the field's own name, so it echoes the item head ("Party A
+    Current Name" vs. "CURRENT NAME"), while genuine parts ("First", "Suffix")
+    do not. Party/section qualifiers are stripped first so "Party A Current
+    Name" and "CURRENT NAME" compare directly.
+
+    Left in, such a token becomes a phantom part that matches no DI field and
+    shifts the separator list out of step with the real parts.
+    """
+    if not item_head:
+        return False
+    t = norm(re.sub(r"\bparty\s+[ab]\b|\bdecedent\b|\bofficiant\b", " ", token, flags=re.I))
+    h = norm(item_head)
+    if not t or not h:
+        return False
+    if t == h or t in h or h in t:
+        return True
+    return fuzz.token_set_ratio(t, h) >= 88
+
+
+def _part_labels(item: str | None, instruction: str | None) -> list[str]:
+    """Component labels for a rule that spans several printed fields.
+
+    Thin wrapper over ``_parse_format_clause`` kept for callers that only need
+    the labels.
+    """
+    labels, _ = _parse_format_clause(item, instruction)
+    return labels
+
+
+def _parse_format_clause(item: str | None,
+                         instruction: str | None) -> tuple[list[str], list[str]]:
+    """Return ``(part_labels, part_separators)`` for a multi-part rule.
+
+    The instruction states both the parts and how they are joined::
+
+        FORMAT: <First> + <Middle> + <Last> + <Suffix>
+        <Street Number> <Street Name> comma <City> comma <State> <Zip Code>
+
+    Separators are read from the literal text BETWEEN consecutive ``<...>``
+    tokens: the word "comma" means ", "; "+" or plain whitespace means " ".
+    ``part_separators[i]`` is what precedes ``part_labels[i]``, so the first
+    entry is always "".
+
+    Tokens naming the data source rather than a printed part are dropped (see
+    ``_is_source_token``).
+
+    Anchoring: when a ``FORMAT:`` clause is present it is authoritative -- the
+    tokens before it name the DATA SOURCE ("PRINT <Party A Current Name>") and
+    only those after it describe the printed layout, so parsing starts there and
+    no guessing is needed. This covers ~60-70% of rules. ``FORMAT:`` is absent in
+    the rest, and those fall back to ``_is_source_token``'s echo heuristic.
+
+    Falls back to the tail of the item name (space-joined) when the instruction
+    has no token list. Returns ``([], [])`` for ordinary single-field rules.
+    """
+    text = clean_text(instruction or "")
+    head = _item_head(item)
+
+    # Prefer an explicit FORMAT: anchor; everything before it is the source.
+    fmt_anchor = _FORMAT_ANCHOR_RE.search(text)
+    scan_from = fmt_anchor.end() if fmt_anchor else 0
+
+    kept: list[tuple[str, int, int]] = []  # (label, start, end)
+    for match in _FORMAT_TOKEN_RE.finditer(text, scan_from):
+        label = clean_text(match.group(1))
+        if not label or len(label) > 30:
+            continue
+        # With a FORMAT: anchor every remaining token is a printed part, so the
+        # source-echo heuristic (which can misfire) is skipped entirely.
+        if not fmt_anchor and _is_source_token(label, head):
+            continue
+        kept.append((label, match.start(), match.end()))
+
+    parts: list[str] = []
+    separators: list[str] = []
+    for idx, (label, start, _end) in enumerate(kept):
+        if idx == 0:
+            separators.append("")
+        else:
+            gap = text[kept[idx - 1][2]:start]
+            separators.append(", " if re.search(r"\bcomma\b", gap, re.I) else " ")
+        parts.append(label)
+
+    if len(parts) >= 2:
+        return parts, separators
+
+    m = _PART_TAIL_RE.search(clean_text(item or ""))
+    if m:
+        fallback = _split_parts(m.group(1))
+        if len(fallback) >= 2:
+            return fallback, [""] + [" "] * (len(fallback) - 1)
+    return [], []
+
+
 def parse_rules(path: str | Path, sheet: str) -> list[PrintRule]:
     raw = pd.read_excel(path, sheet_name=sheet, header=None, engine="openpyxl", dtype=str).fillna("")
     header_idx = _find_header_row(raw)
@@ -214,6 +383,9 @@ def parse_rules(path: str | Path, sheet: str) -> list[PrintRule]:
         if not any(data.values()):
             continue
         expected_kind, expected_options = _parse_example(data.get("example"), None)
+        part_labels, part_separators = _parse_format_clause(
+            item, data.get("instruction")
+        )
         # Fallback: when the example gave us no checkbox options, mine the
         # printing instruction for "place an X in the <label> checkbox" phrases.
         # This recovers options for rows whose example image OCR is empty.
@@ -235,6 +407,8 @@ def parse_rules(path: str | Path, sheet: str) -> list[PrintRule]:
             example=data.get("example"),
             expected_kind=expected_kind,
             expected_options=expected_options,
+            part_labels=part_labels,
+            part_separators=part_separators,
             max_chars=data.get("max_chars"),
             shrink_size=data.get("shrink_size"),
             char_size=data.get("char_size"),

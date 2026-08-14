@@ -20,4 +20,5 @@ class Settings:
     # the deterministic pipeline works with no OpenAI credentials/cost.
     PRINTIQ_USE_STEP10 = os.getenv("PRINTIQ_USE_STEP10", "false").lower() == "true"
 
+    PRINTIQ_USE_V4_PIPELINE = os.getenv("PRINTIQ_USE_V4_PIPELINE", "true").lower() == "true"
 settings = Settings()

@@ -354,7 +354,15 @@ class AzureDocumentIntelligenceEngine:
         Call ``prebuilt-layout`` requesting every supported add-on feature, then
         gracefully degrade to a plain layout call if the service/SDK rejects the
         feature set (older SDKs, unsupported regions, etc.).
+
+        When the degraded path is taken, ``self.features_degraded`` records the
+        reason: without STYLE_FONT the ``formatting`` dict carries no
+        font_weight/font_style, so downstream bold/italic checks become
+        inconclusive rather than authoritative. ``_analyze_impl`` surfaces this
+        on ``analysis.raw`` so the report can flag it instead of silently
+        reporting every bold rule as unverifiable.
         """
+        self.features_degraded = None
         features = self._build_features()
         kwargs = {"body": AnalyzeDocumentRequest(bytes_source=data)}
         if features:
@@ -362,7 +370,12 @@ class AzureDocumentIntelligenceEngine:
         try:
             poller = self.client.begin_analyze_document("prebuilt-layout", **kwargs)
             return poller.result(timeout=_DI_ANALYZE_TIMEOUT)
-        except Exception:
+        except Exception as exc:
+            self.features_degraded = (
+                f"Add-on features (KEY_VALUE_PAIRS/STYLE_FONT) were rejected "
+                f"({type(exc).__name__}: {exc}); fell back to plain layout. "
+                f"Bold/italic checks are unreliable for this run."
+            )
             poller = self.client.begin_analyze_document(
                 "prebuilt-layout",
                 AnalyzeDocumentRequest(bytes_source=data),
@@ -509,6 +522,11 @@ class AzureDocumentIntelligenceEngine:
         result = self._run_analysis(data)
 
         analysis = PdfAnalysis(full_text=getattr(result, "content", "") or "", raw={})
+        # Surface a degraded feature set (no STYLE_FONT -> no font_weight) so the
+        # UI/report can warn that bold checks are inconclusive for this run,
+        # rather than silently emitting unverifiable bold results.
+        if getattr(self, "features_degraded", None):
+            analysis.raw["features_degraded"] = self.features_degraded
         pages = getattr(result, "pages", []) or []
         analysis.pages = len(pages)
 
@@ -658,6 +676,24 @@ class AzureDocumentIntelligenceEngine:
         except Exception as exc:  # pragma: no cover - defensive
             analysis.structured_fields = []
             analysis.raw["postprocess_error"] = str(exc)
+
+        # ===== Step 10a relabel =====
+        # Splits over-merged composites (e.g. OFFICIANT NAME + MAILING ADDRESS,
+        # WITNESS 1 + WITNESS 2) back into distinct text fields so each rule can
+        # match its own field, and - when Azure OpenAI is configured - re-pairs
+        # each checkbox group's key with the question stem actually printed above
+        # it. Fail-safe: any error keeps the geometry output unchanged.
+        if analysis.structured_fields:
+            try:
+                from modules.di_postprocessor import page_lines as _page_lines
+                from modules.di_relabel import relabel_fields
+
+                analysis.structured_fields = relabel_fields(
+                    analysis.structured_fields, _page_lines(analysis)
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                analysis.raw["relabel_error"] = str(exc)
+        # END Step 10a
 
         # Step 10 (optional): LLM refinement of section/subsection/key only.
         # Gated by PRINTIQ_USE_STEP10 so the deterministic path needs no OpenAI

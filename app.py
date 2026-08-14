@@ -4,7 +4,8 @@ import hashlib
 import pandas as pd
 
 from utils.file_utils import create_session_dir, save_upload
-from modules.excel_parser import workbook_sheets, parse_rules, enrich_rules_with_images
+from modules.excel_parser import workbook_sheets, parse_rules
+from modules.excel_all_image_ocr import enrich_rules_with_all_images
 from modules.rule_classifier import classify_rules
 from modules.rule_repair import repair_rules
 from modules.sheet_matcher import suggest_sheet
@@ -181,7 +182,7 @@ else:
     # anchors). Best-effort: no images / no OCR -> unchanged rules.
     with st.spinner("Extracting example images from the Excel rules..."):
         try:
-            parsed_rules = enrich_rules_with_images(
+            parsed_rules = enrich_rules_with_all_images(
                 parsed_rules, excel_path, selected_sheet,
                 out_dir=session_dir / "example_images", ocr_engine=di_engine,
                 max_workers=4,
@@ -257,14 +258,21 @@ st.subheader("4. Rule vs. PDF comparison")
 # instruction validation). Cached per (Excel, PDF, sheet) so filter/page
 # interactions don't re-run it. This comparison is the single source of truth;
 # the overlay and downloads are derived from it via the adapter.
-_cmp_key = f"cmp::{excel_hash}::{pdf_hash}::{selected_sheet}"
+_cmp_key = f"cmp-v4-3::{excel_hash}::{pdf_hash}::{selected_sheet}"
 if st.session_state.get("cmp_key") == _cmp_key and "comparison_summary" in st.session_state:
     comparison_summary = st.session_state["comparison_summary"]
 else:
     with st.spinner("Comparing rules against the PDF..."):
-        comparison_summary = ComparisonEngine(
-            selected_sheet, rules, analysis.structured_fields
-        ).run()
+        if settings.PRINTIQ_USE_V4_PIPELINE:
+            from modules.v4_integration.pipeline import V4Pipeline
+            comparison_summary = V4Pipeline().run(selected_sheet, rules, analysis, native=native)
+        else:
+            comparison_summary = ComparisonEngine(
+                selected_sheet, rules, analysis.structured_fields,
+                key_value_pairs=analysis.key_value_pairs,
+            ).run()
+    from modules.post_comparison_recovery import enhance_summary
+    comparison_summary = enhance_summary(comparison_summary, rules, analysis, selected_sheet)
     st.session_state["comparison_summary"] = comparison_summary
     st.session_state["cmp_key"] = _cmp_key
 

@@ -5,6 +5,8 @@
   * Phase C.2 — ``verify_kv_pairs``: assess each matched key/value pairing.
   * Phase D/E — ``validate_instruction``: judge a printed value against its
     print instruction (and, when the value is unknown, its ``if_unknown`` rule).
+  * Step 10a — ``relabel_checkbox_key``: re-pair a checkbox group's key with the
+    printed question stem it actually belongs to.
 
 All functions are **best-effort and guardrailed**: the LLM only aligns, judges,
 or flags — it never invents options or changes checkbox states. Any error,
@@ -131,6 +133,70 @@ def align_checkbox_options(
     if not clean_pairs:
         return None
     return {"pairs": clean_pairs}
+
+
+def relabel_checkbox_key(
+    *,
+    current_key: str,
+    options: List[str],
+    candidate_labels: List[str],
+) -> Optional[str]:
+    """Step 10a: pick the printed question stem a checkbox group belongs to.
+
+    The geometry layer assigns a checkbox group the nearest printed label above
+    it, which is sometimes a neighbouring column's header rather than the real
+    question (e.g. RACE options labelled with the HISPANIC stem, or the
+    LICENSE-FEE header stolen by an adjacent option strip). Here the model
+    chooses the best stem from ``candidate_labels`` — the lines physically
+    printed around the group.
+
+    GUARDRAILS (enforced in code, not just in the prompt):
+      * the returned string must be **verbatim** one of ``candidate_labels``;
+      * an option word can never be returned as the key;
+      * ``None`` is returned on any failure so the caller keeps the geometry key.
+    """
+    if not candidate_labels:
+        return None
+
+    option_set = {o.strip().upper() for o in options if o and o.strip()}
+    # A stem is never one of the group's own option words.
+    allowed = [c for c in candidate_labels if c.strip().upper() not in option_set]
+    if not allowed:
+        return None
+
+    system = (
+        "You label checkbox groups on U.S. vital-records forms. Given a group's "
+        "option words and the printed lines around it, choose which line is the "
+        "QUESTION STEM the options answer (e.g. 'PREVIOUS MARRIAGE ENDED BY', "
+        "'RACE - Check all that apply'). You MUST copy one candidate verbatim; "
+        "never invent text, never return an option word, and never return a "
+        "section/heading bar that covers unrelated fields. If none of the "
+        "candidates is the stem, return null. Respond with strict JSON."
+    )
+    user = {
+        "current_key": current_key,
+        "options": options,
+        "candidate_labels": allowed,
+        "instructions": (
+            'Return JSON: {"key": "<one candidate copied verbatim>"} or '
+            '{"key": null} when no candidate is the question stem.'
+        ),
+    }
+    result = _chat_json(
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(user)},
+        ],
+        max_tokens=200,
+    )
+    if not isinstance(result, dict):
+        return None
+    key = result.get("key")
+    if not isinstance(key, str) or not key.strip():
+        return None
+    # Verbatim guard: only accept text that physically appears on the page.
+    lookup = {c.strip().upper(): c for c in allowed}
+    return lookup.get(key.strip().upper())
 
 
 def validate_instruction(
