@@ -46,6 +46,9 @@ def _comparison_to_result(c: FieldComparison, index: int) -> ValidationResult:
             "di_value": c.di_value,
             "match_score": c.match_score,
             "matched": c.matched,
+            "internal_status": (c.metadata or {}).get("internal_status"),
+            "reviewer_status": c.status.value,
+            "review_reason": (c.metadata or {}).get("review_reason", ""),
         },
     )
 
@@ -54,6 +57,8 @@ def comparison_to_results(summary: ComparisonSummary) -> List[ValidationResult]:
     """Convert every comparison row into a ValidationResult (best-effort)."""
     out: List[ValidationResult] = []
     for i, c in enumerate(summary.comparisons, start=1):
+        if c.rule_type == "UNMATCHED_FIELD" or (c.metadata or {}).get("technical_only"):
+            continue
         try:
             out.append(_comparison_to_result(c, i))
         except Exception:

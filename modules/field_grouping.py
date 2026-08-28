@@ -79,6 +79,27 @@ def _part_score(part: str, field: dict) -> float:
     return float(fuzz.token_set_ratio(p_norm, k_norm))
 
 
+
+def _is_standalone_part_field(field: dict, part_labels: List[str]) -> bool:
+    """True only for a child component, never for a sibling logical field.
+
+    A full key such as 'WITNESS 2 NAME - First, Middle, Last' resembles several
+    part labels, but it is an independent parent field. Genuine child fields
+    are short and correspond to exactly one declared part.
+    """
+    key = clean_text(field.get("key") or "")
+    if not key:
+        return False
+    scores = sorted((_part_score(part, field) for part in part_labels), reverse=True)
+    strong = [score for score in scores if score >= _PART_MATCH_FLOOR]
+    # More than one strong part match means that the candidate is itself a
+    # complete/compound label and must not be consumed as another field's child.
+    if len(strong) != 1:
+        return False
+    # Child labels are concise. This also protects numbered/qualified sibling
+    # fields while remaining language- and client-independent.
+    return len(norm(key).split()) <= 4
+
 def collect_group(
     anchor: dict,
     part_labels: List[str],
@@ -103,6 +124,7 @@ def collect_group(
         and f["order"] != anchor["order"]
         and same_line(anchor, f)
         and f.get("kind") != "checkbox_group"
+        and _is_standalone_part_field(f, part_labels)
     ]
     if not line_mates:
         return [anchor]
@@ -126,7 +148,8 @@ def collect_group(
 
 
 def merge_group(group: List[dict], part_labels: List[str],
-                part_separators: Optional[List[str]] = None) -> dict:
+                part_separators: Optional[List[str]] = None,
+                canonical_key: Optional[str] = None) -> dict:
     """Collapse a field group into one record the existing checks can consume.
 
     Parts are joined in printed (left-to-right) order using the separators the
@@ -144,6 +167,12 @@ def merge_group(group: List[dict], part_labels: List[str],
             {"key": group[0].get("key", ""), "value": group[0].get("value", "")}
         ]
         merged["_group_orders"] = [group[0]["order"]]
+        merged["_composite_expected_parts"] = list(part_labels or [])
+        merged["_composite_detected_parts"] = [group[0].get("key", "")]
+        exact_atomic = bool(canonical_key) and norm(group[0].get("key") or "") == norm(canonical_key or "")
+        merged["_composite_complete"] = exact_atomic or len(part_labels or []) <= 1
+        if exact_atomic and part_labels:
+            merged["_candidate_reconstruction_source"] = "ATOMIC_COMPLETE_LABEL"
         return merged
 
     parts = [{"key": f.get("key") or "", "value": clean_text(f.get("value") or "")}
@@ -164,6 +193,19 @@ def merge_group(group: List[dict], part_labels: List[str],
     merged["_parts"] = parts
     merged["_group_orders"] = [f["order"] for f in group]
     merged["_merged_from"] = len(group)
+    detected = [clean_text(p.get("key") or "") for p in parts if clean_text(p.get("key") or "")]
+    expected = [clean_text(x) for x in (part_labels or []) if clean_text(x)]
+    merged["_composite_expected_parts"] = expected
+    merged["_composite_detected_parts"] = detected
+    merged["_composite_complete"] = len(group) >= min(2, len(expected))
+    # Once two or more geometrically co-linear component fields have been
+    # assembled for a workbook-declared composite, expose the workbook's full
+    # logical label as the candidate key. The original printed child labels are
+    # retained in _parts, so this improves identity without hiding evidence.
+    if canonical_key and len(group) >= 2:
+        merged["_observed_anchor_key"] = merged.get("key")
+        merged["key"] = clean_text(canonical_key)
+        merged["_candidate_reconstruction_source"] = "WORKBOOK_PARTS_AND_SAME_LINE_GEOMETRY"
     return merged
 
 

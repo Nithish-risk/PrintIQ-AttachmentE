@@ -1,0 +1,43 @@
+"""Repair checkbox field ownership before comparison using expected Excel options."""
+from __future__ import annotations
+from copy import deepcopy
+from rapidfuzz import fuzz
+from utils.text_utils import clean_text, norm
+
+def _opts(rule): return [clean_text(x) for x in (getattr(rule,"expected_options",None) or []) if clean_text(x)]
+def _actual(value):
+    return {norm(x.rsplit("-",1)[0]) for x in str(value or "").split(";") if x.strip()}
+def repair_checkbox_fields(rules, fields, key_value_pairs):
+    repaired=[deepcopy(f) for f in (fields or [])]
+    for rule in rules:
+        expected=_opts(rule)
+        if not expected: continue
+        expected_set={norm(x) for x in expected}
+        candidates=[]
+        for field in repaired:
+            if field.get("kind")!="checkbox_group": continue
+            label_score=fuzz.token_set_ratio(norm(rule.item or ""),norm(field.get("key") or ""))
+            actual=_actual(field.get("value"))
+            overlap=len(expected_set & actual)/max(1,len(expected_set)) if actual else 0
+            section=20 if not rule.section or norm(rule.section)==norm(field.get("section") or "") else 0
+            candidates.append((label_score+35*overlap+section,field,actual))
+        if not candidates: continue
+        candidates.sort(key=lambda x:x[0],reverse=True)
+        _,field,actual=candidates[0]
+        raw=field.get("raw") if isinstance(field.get("raw"),dict) else {}
+        label_bbox=field.get("label_bbox") or raw.get("label_bbox") or field.get("bbox") or raw.get("bbox")
+        regrouped=None
+        if isinstance(label_bbox,(list,tuple)) and len(label_bbox)==4 and key_value_pairs:
+            try:
+                from modules.checkbox_geometry import regroup
+                regrouped=regroup(expected,label_bbox,field.get("page",1),key_value_pairs)
+            except Exception: regrouped=None
+        if regrouped:
+            field.setdefault("raw",{})["precomparison_original_value"]=field.get("value")
+            field["value"]=";".join(f"{x['option']}-{'selected' if x.get('selected') else 'unselected'}" for x in regrouped)
+            field["raw"]["checkbox_repair_source"]="EXPECTED_OPTIONS_AND_GEOMETRY"
+            field["raw"]["checkbox_repair_expected_options"]=expected
+        elif actual and not (expected_set & actual):
+            # Prevent a fully disjoint group from masquerading as the rule.
+            field.setdefault("raw",{})["checkbox_option_conflict"]=True
+    return repaired

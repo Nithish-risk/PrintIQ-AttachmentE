@@ -13,6 +13,8 @@ from modules.azure_doc_intelligence import AzureDocumentIntelligenceEngine
 from modules.pdf_native import PdfNativeEngine
 from modules.comparison_engine import ComparisonEngine
 from modules.comparison_adapter import comparison_to_results
+from modules.reviewer_outcomes import apply_reviewer_outcomes
+from modules.matcher_guard import apply_identity_guard
 from modules.report_writer import (
     write_json,
     write_xlsx,
@@ -22,11 +24,13 @@ from modules.report_writer import (
 from config.constants import Status
 from config.settings import settings
 
+from modules.overlay_sync import prepare_overlay_bundle
 from modules.visual_overlay import (
     STATUS_COLORS_HEX,
     group_results_by_page,
     render_page_with_results,
     build_annotated_pdf_bytes,
+    resolve_label_targets,
 )
 
 st.set_page_config(page_title="printiq", layout="wide", page_icon="📑")
@@ -49,30 +53,18 @@ with st.sidebar:
     )
     st.divider()
     st.header("Overlay filters")
-    st.caption("Colors below match the boxes drawn on the PDF overlay.")
-    # Statuses hidden from the UI filters (kept valid in the enum, just not
-    # surfaced to the reviewer as overlay/table filters).
-    _HIDDEN_STATUSES = {
-        Status.NOT_VALIDATED,
-        Status.EXCEL_RULE_ISSUE,
-        Status.INFO,
-        Status.WARNING,
-    }
-    visible_statuses = [s for s in Status if s not in _HIDDEN_STATUSES]
-    default_statuses = [s.value for s in visible_statuses]
+    st.caption("The table, preview, and annotated PDF use the same final result.")
+    _REVIEWER_STATUSES = [Status.PASS, Status.FAIL, Status.REVIEW_REQUIRED]
     enabled_statuses = []
-    for s in visible_statuses:
+    _LABELS = {Status.PASS: "Pass", Status.FAIL: "Fail", Status.REVIEW_REQUIRED: "Review Required"}
+    for _status in _REVIEWER_STATUSES:
         swatch_col, check_col = st.columns([1, 8])
         with swatch_col:
-            color = STATUS_COLORS_HEX.get(s.value, "#2563EB")
-            st.markdown(
-                f"<div style='width:16px;height:16px;border-radius:3px;"
-                f"background:{color};border:1px solid #333;margin-top:6px;'></div>",
-                unsafe_allow_html=True,
-            )
+            color = STATUS_COLORS_HEX.get(_status.value, "#6246EA")
+            st.markdown(f"<div style='width:16px;height:16px;border-radius:3px;background:{color};border:1px solid #333;margin-top:6px;'></div>", unsafe_allow_html=True)
         with check_col:
-            if st.checkbox(s.value, value=True):
-                enabled_statuses.append(s.value)
+            if st.checkbox(_LABELS[_status], value=True, key=f"overlay_{_status.value}"):
+                enabled_statuses.append(_status.value)
 
 if not excel_file or not pdf_file:
     st.session_state.pop("submitted", None)
@@ -258,7 +250,7 @@ st.subheader("4. Rule vs. PDF comparison")
 # instruction validation). Cached per (Excel, PDF, sheet) so filter/page
 # interactions don't re-run it. This comparison is the single source of truth;
 # the overlay and downloads are derived from it via the adapter.
-_cmp_key = f"cmp-v4-3::{excel_hash}::{pdf_hash}::{selected_sheet}"
+_cmp_key = f"cmp-v5-4-8-overlay-sync::{excel_hash}::{pdf_hash}::{selected_sheet}"
 if st.session_state.get("cmp_key") == _cmp_key and "comparison_summary" in st.session_state:
     comparison_summary = st.session_state["comparison_summary"]
 else:
@@ -273,6 +265,17 @@ else:
             ).run()
     from modules.post_comparison_recovery import enhance_summary
     comparison_summary = enhance_summary(comparison_summary, rules, analysis, selected_sheet)
+    # Reject unsafe field identities before any validation result reaches the
+    # reviewer UI, overlays, JSON, or Excel exports.
+    comparison_summary = apply_identity_guard(comparison_summary)
+    comparison_summary = apply_reviewer_outcomes(comparison_summary)
+    comparison_summary.llm_findings.append({
+        "type": "runtime_provenance",
+        "application_version": "5.4.6",
+        "comparison_cache_version": "cmp-v5-4-6",
+        "identity_guard_version": "1.4.0",
+        "loaded_matcher_guard_path": str(Path(__file__).parent / "modules" / "matcher_guard.py"),
+    })
     st.session_state["comparison_summary"] = comparison_summary
     st.session_state["cmp_key"] = _cmp_key
 
@@ -282,9 +285,6 @@ results = comparison_to_results(comparison_summary)
 
 st.session_state.results = results
 st.session_state.selected_sheet = selected_sheet
-
-# Status values hidden from every UI table.
-HIDDEN_STATUS_VALUES = {s.value for s in _HIDDEN_STATUSES}
 
 st.subheader("5. Azure Document Intelligence output")
 # Serialize the complete analysis (full text, every element + bbox, paragraphs,
@@ -302,88 +302,44 @@ st.download_button(
 )
 
 st.subheader("6. Rule vs. PDF comparison details")
-
+_reviewer_comparisons = [c for c in comparison_summary.comparisons if c.rule_type not in {"UNMATCHED_FIELD", "NO_PRINT_RULE"} and c.rule_id and not (c.metadata or {}).get("technical_only")]
+_pass = sum(c.status == Status.PASS for c in _reviewer_comparisons)
+_fail = sum(c.status == Status.FAIL for c in _reviewer_comparisons)
+_review = sum(c.status == Status.REVIEW_REQUIRED for c in _reviewer_comparisons)
 cmp_cols = st.columns(4)
-cmp_cols[0].metric("Rules compared", len(comparison_summary.comparisons))
-cmp_cols[1].metric("Matched", comparison_summary.matched_count)
-cmp_cols[2].metric("Unmatched rules", len(comparison_summary.unmatched_rules))
-cmp_cols[3].metric("Unmatched DI fields", len(comparison_summary.unmatched_fields))
+cmp_cols[0].metric("Rules compared", len(_reviewer_comparisons))
+cmp_cols[1].metric("Pass", _pass)
+cmp_cols[2].metric("Fail", _fail)
+cmp_cols[3].metric("Review required", _review)
 
-st.write("**Status breakdown**")
-st.dataframe(
-    pd.DataFrame(
-        [(k, v) for k, v in comparison_summary.status_counts.items() if k not in HIDDEN_STATUS_VALUES],
-        columns=["status", "count"],
-    ),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.write("**Side-by-side: Excel rule vs. matched DI field**")
-# Phase C status: show whether the LLM verification ran and how many findings.
-try:
-    from modules.checkbox_llm import _get_helper as _cb_helper
-    _llm_on = bool(_cb_helper().enabled)
-except Exception:
-    _llm_on = False
-_n_findings = len(comparison_summary.llm_findings or [])
-_n_irregular = sum(
-    1 for f in (comparison_summary.llm_findings or [])
-    if isinstance(f, dict) and str(f.get("verdict")) == "irregular"
-)
-if _llm_on:
-    st.caption(f"🧠 LLM verification: **enabled** — assessed {_n_findings} row(s), "
-               f"{_n_irregular} flagged as irregular.")
+st.write("**Excel vs. PDF comparison results**")
+_definitive_rows, _review_rows = [], []
+for c in _reviewer_comparisons:
+    row = {"result": c.status.value, "rule_id": c.rule_id, "rule_type": c.rule_type,
+           "section": c.section, "subsection": c.subsection, "excel_item": c.item,
+           "pdf_field": c.di_key, "pdf_value": c.di_value,
+           "match_confidence": c.match_score, "page": c.page, "comment": c.message}
+    if c.status in {Status.PASS, Status.FAIL}:
+        if c.status.value in enabled_statuses: _definitive_rows.append(row)
+    elif c.status == Status.REVIEW_REQUIRED:
+        row["review_reason"] = (c.metadata or {}).get("review_reason", c.message)
+        _review_rows.append(row)
+if _definitive_rows:
+    st.dataframe(pd.DataFrame(_definitive_rows), use_container_width=True, hide_index=True)
 else:
-    st.caption("🧠 LLM verification: **disabled** (Azure OpenAI not configured / `PRINTIQ_USE_AOAI` off). "
-               "Checkbox alignment and notes will be blank.")
-# Phase C.2: map each row's verdict/note back to its rule for the table column.
-def _fmt_verdict(f: dict) -> str:
-    verdict = str(f.get("verdict") or "")
-    note = str(f.get("note") or "")
-    if verdict == "irregular":
-        return f"⚠️ {note or 'irregular pairing'}"
-    return f"✓ {note}" if note else "✓ consistent"
+    st.info("No Pass or Fail results match the active filters.")
 
+st.write("**Review Required**")
+if Status.REVIEW_REQUIRED.value not in enabled_statuses:
+    st.caption("Review Required is hidden by the active overlay filter.")
+elif _review_rows:
+    st.dataframe(pd.DataFrame(_review_rows), use_container_width=True, hide_index=True)
+else:
+    st.success("No results require manual review.")
 
-_llm_note_by_rule = {
-    f.get("rule_id"): _fmt_verdict(f)
-    for f in (comparison_summary.llm_findings or [])
-    if isinstance(f, dict)
-}
-comparison_rows = [
-    {
-        "status": c.status.value,
-        "rule_id": c.rule_id,
-        "rule_type": c.rule_type,
-        "section": c.section,
-        "item": c.item,
-        "matched": c.matched,
-        "score": c.match_score,
-        "di_key": c.di_key,
-        "di_value": c.di_value,
-        "page": c.page,
-        "message": c.message,
-        "llm_note": _llm_note_by_rule.get(c.rule_id, ""),
-    }
-    for c in comparison_summary.comparisons
-    if c.status.value not in HIDDEN_STATUS_VALUES
-]
-st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
-
-# Phase C.2: separate LLM verification findings expander (alternative view).
 if comparison_summary.llm_findings:
-    with st.expander(f"LLM verification findings — {len(comparison_summary.llm_findings)}", expanded=False):
-        st.dataframe(
-            pd.DataFrame(comparison_summary.llm_findings),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-with st.expander("Rules with no matching DI field (possible missing output)"):
-    st.dataframe(pd.DataFrame(comparison_summary.unmatched_rules), use_container_width=True, hide_index=True)
-with st.expander("DI fields matched by no rule (possible extra output)"):
-    st.dataframe(pd.DataFrame(comparison_summary.unmatched_fields), use_container_width=True, hide_index=True)
+    with st.expander(f"Technical verification findings — {len(comparison_summary.llm_findings)}", expanded=False):
+        st.dataframe(pd.DataFrame(comparison_summary.llm_findings), use_container_width=True, hide_index=True)
 
 out_cmp_json = session_dir / "rule_pdf_comparison.json"
 out_cmp_xlsx = session_dir / "rule_pdf_comparison.xlsx"
@@ -410,25 +366,28 @@ with cc2:
     )
 
 st.subheader("7. Visual PDF overlay")
+# SINGLE SOURCE OF TRUTH: resolve the final filtered reviewer results once.
+# Both the UI preview and downloaded annotated PDF consume this same immutable
+# label-only collection. No second resolver and no original/value bbox list.
+overlay_bundle = prepare_overlay_bundle(pdf_path, results, enabled_statuses)
+label_overlay_results = overlay_bundle.results
+results_by_page = overlay_bundle.by_page
+overlay_audit = overlay_bundle.audit
 
-# Results already filtered by sidebar statuses for the table. Use the same filter for the overlay.
-filtered_results = [r for r in results if r.status.value in enabled_statuses]
-# Group by 0-based page index (visual_overlay converts 1-based page -> 0-based).
-results_by_page = group_results_by_page(filtered_results)
+st.caption(
+    f"Label overlays located: {overlay_audit.get('labels_located', 0)} / "
+    f"{overlay_audit.get('filtered_final_results', 0)}"
+)
 page_options = sorted(results_by_page.keys()) or [0]
-
 selected_page = st.selectbox(
     "Select page to inspect",
     options=page_options,
     format_func=lambda page_idx: f"Page {page_idx + 1}",
     index=0,
 )
-
 overlay_image = render_page_with_results(
     pdf_path,
     page_index=selected_page,
-    # ``results_by_page`` is already keyed by the correct 0-based page, so pass
-    # exactly that page's results (no cross-page bleed).
     results=results_by_page.get(selected_page, []),
     dpi=150,
     color_map=STATUS_COLORS_HEX,
@@ -449,8 +408,7 @@ write_xlsx(results, out_xlsx)
 
 try:
     annotated_pdf_bytes = build_annotated_pdf_bytes(
-        pdf_path,
-        filtered_results,
+        pdf_path, label_overlay_results,
         color_map=STATUS_COLORS_HEX,
         enabled_statuses=enabled_statuses,
     )

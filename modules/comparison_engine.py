@@ -276,7 +276,10 @@ class RuleFieldMatcher:
             if rule.id in assigned or field["order"] in self._used:
                 continue
             group = collect_group(field, rule.part_labels, self.fields, self._used)
-            merged = merge_group(group, rule.part_labels, rule.part_separators)
+            merged = merge_group(
+                group, rule.part_labels, rule.part_separators,
+                canonical_key=rule.item,
+            )
             merged["_match_score"] = round(score, 2)
             assigned[rule.id] = merged
             for order in merged.get("_group_orders", [field["order"]]):
@@ -1368,6 +1371,31 @@ class ComparisonEngine:
                 confidence=field["confidence"] if field else None,
                 checks=checks,
                 message="; ".join(c.message for c in checks if c.message),
+                metadata=(
+                    {
+                        "candidate_reconstruction_source": field.get("_candidate_reconstruction_source"),
+                        "observed_anchor_key": field.get("_observed_anchor_key"),
+                        "composite_expected_parts": field.get("_composite_expected_parts", []),
+                        "composite_detected_parts": field.get("_composite_detected_parts", []),
+                        "composite_complete": field.get("_composite_complete"),
+                        "expected_subsection": rule.subsection,
+                        "observed_subsection": field.get("subsection"),
+                        "expected_options": list(rule.expected_options or []),
+                        "if_unknown_rule": rule.if_unknown,
+                        "instruction_validation_mode": (
+                            "FORMAT_EXAMPLE_ONLY" if "DROPDOWN VALUE SELECTED" in norm(rule.instruction or "")
+                            and not (rule.expected_options or []) else "STANDARD"
+                        ),
+                        "checkbox_payload_valid": (
+                            (field.get("raw") or {}).get("checkbox_payload_valid")
+                            if isinstance(field.get("raw"), dict) else None
+                        ),
+                        "subsection_spec_conflict": bool(
+                            rule.subsection and field.get("subsection")
+                            and norm(rule.subsection) != norm(field.get("subsection"))
+                        ),
+                    } if field else {}
+                ),
             )
             comparisons.append(comparison)
             if field is None:

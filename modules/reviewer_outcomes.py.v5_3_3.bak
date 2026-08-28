@@ -1,0 +1,37 @@
+"""Reviewer-facing PASS/FAIL/REVIEW_REQUIRED roll-up."""
+from collections import Counter
+from config.constants import Status
+
+def _v(x): return getattr(x, "value", str(x or ""))
+
+def _reason(c):
+    reasons=[]; meta=dict(c.metadata or {})
+    if not c.matched: reasons.append("No confident PDF field match was found.")
+    if meta.get("v4_workflow_state")=="REVIEW_REQUIRED": reasons.append("The sequence-aware matcher marked this row for review.")
+    for check in c.checks or []:
+        if _v(check.status) in {Status.NOT_VALIDATED.value,Status.EXCEL_RULE_ISSUE.value,Status.WARNING.value,Status.INFO.value,Status.MISSING_DATA.value,Status.UNKNOWN_DATA.value}:
+            if check.message: reasons.append(str(check.message).strip())
+    if not reasons: reasons.append(c.message or "The result could not be concluded safely.")
+    return " ".join(dict.fromkeys(x for x in reasons if x))
+
+def reviewer_status(c):
+    original=_v(c.status); checks={_v(x.status) for x in (c.checks or [])}
+    if original==Status.FAIL.value or Status.FAIL.value in checks: return Status.FAIL
+    if original==Status.PASS.value and c.matched and checks.issubset({Status.PASS.value}): return Status.PASS
+    return Status.REVIEW_REQUIRED
+
+def apply_reviewer_outcomes(summary):
+    for c in summary.comparisons:
+        if c.rule_type == "UNMATCHED_FIELD" or not c.rule_id:
+            c.metadata=dict(c.metadata or {})
+            c.metadata["technical_only"]=True
+            continue
+        original=_v(c.status); final=reviewer_status(c)
+        c.metadata=dict(c.metadata or {})
+        c.metadata.update({"internal_status":original,"reviewer_status":final.value})
+        if final==Status.REVIEW_REQUIRED:
+            c.metadata["review_reason"]=_reason(c); c.message=c.metadata["review_reason"]
+        else: c.metadata.pop("review_reason",None)
+        c.status=final
+    summary.status_counts=dict(Counter(c.status.value for c in summary.comparisons if not (c.metadata or {}).get("technical_only")))
+    return summary

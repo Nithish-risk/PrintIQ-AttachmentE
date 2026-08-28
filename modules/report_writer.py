@@ -47,6 +47,8 @@ def _comparison_flat_records(summary) -> list[dict]:
     """Flatten a ComparisonSummary's comparisons into table rows."""
     rows = []
     for c in summary.comparisons:
+        if c.rule_type == "UNMATCHED_FIELD" or not c.rule_id:
+            continue
         d = c.model_dump(mode="json")
         row = {
             "id": d.get("id"),
@@ -76,6 +78,12 @@ def _comparison_flat_records(summary) -> list[dict]:
 def write_comparison_json(summary, out_path: str | Path):
     """Serialize a full ComparisonSummary (with coverage lists) to JSON."""
     data = summary.model_dump(mode="json")
+    data.pop("unmatched_rules", None)
+    data.pop("unmatched_fields", None)
+    data["comparisons"] = [
+        c for c in data.get("comparisons", [])
+        if c.get("rule_type") != "UNMATCHED_FIELD" and c.get("rule_id")
+    ]
     if settings.PRINTIQ_MASK_PII:
         for c in data.get("comparisons", []):
             for k in ("di_value", "message"):
@@ -92,12 +100,8 @@ def write_comparison_xlsx(summary, out_path: str | Path):
         pd.DataFrame(list(summary.status_counts.items()), columns=["status", "count"])
         if summary.status_counts else pd.DataFrame()
     )
-    unmatched_rules_df = pd.DataFrame(summary.unmatched_rules)
-    unmatched_fields_df = pd.DataFrame(summary.unmatched_fields)
     with pd.ExcelWriter(out_path, engine=_excel_engine()) as writer:
         status_df.to_excel(writer, index=False, sheet_name="Summary")
         comparisons_df.to_excel(writer, index=False, sheet_name="Comparisons")
-        unmatched_rules_df.to_excel(writer, index=False, sheet_name="Unmatched Rules")
-        unmatched_fields_df.to_excel(writer, index=False, sheet_name="Unmatched Fields")
     return str(out_path)
 

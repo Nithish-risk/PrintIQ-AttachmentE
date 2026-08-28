@@ -3,6 +3,7 @@ from enum import Enum
 class Status(str, Enum):
     PASS = "PASS"
     FAIL = "FAIL"
+    REVIEW_REQUIRED = "REVIEW_REQUIRED"
     WARNING = "WARNING"
     # Field located on the PDF but its value is a placeholder/sentinel
     # (e.g. "Unknown", "N/A").
@@ -17,6 +18,7 @@ class Status(str, Enum):
 STATUS_COLORS = {
     Status.PASS: (0.10, 0.70, 0.20),
     Status.FAIL: (0.90, 0.10, 0.10),
+    Status.REVIEW_REQUIRED: (0.384, 0.275, 0.918),  # blue-violet #6246EA
     Status.WARNING: (1.00, 0.72, 0.05),
     Status.UNKNOWN_DATA: (0.55, 0.35, 0.85),   # purple
     Status.MISSING_DATA: (0.10, 0.35, 0.95),   # blue
